@@ -26,6 +26,7 @@
 ;;     previously failed install is in theory possible. Currently `el-get'
 ;;     will refrain from removing your package automatically, though.
 ;;   - Fix ELPA remove method, adding a "removed" state too.
+;;   - Implement CVS login support.
 ;;
 ;;  0.9 - 2010-08-24 - build me a shell
 ;;
@@ -229,10 +230,16 @@ definition provided by `el-get' recipes locally.
 
 :options
 
-    Currently only used by the http-tar support for you to give
-    the tar options you want to use. Typically would be \"xzf\",
-    but you might want to choose \"xjf\" for handling .tar.bz
-    files e.g.
+    Currently used by http-tar and cvs support.
+
+    When using http-tar, it allows you to give the tar options
+    you want to use. Typically would be \"xzf\", but you might
+    want to choose \"xjf\" for handling .tar.bz files e.g.
+
+    When using CVS, when it's set to \"login\", `el-get' will
+    first issue a `cvs login' against the server, asking you
+    interactively (in the minibuffer) any password you might to
+    enter, and only then it will run the `cvs checkout' command.
 
 :module
 
@@ -369,6 +376,7 @@ Any other property will get put into the process object.
 				  (file-name-as-directory
 				   (expand-file-name cdir))
 				default-directory))
+	   (process-connection-type nil) ; pipe, don't pretend we're a pty
 	   (proc    (apply startf cname cbuf program args)))
 
       ;; add the properties to the process, then set the sentinel
@@ -378,7 +386,11 @@ Any other property will get put into the process object.
       (process-put proc :el-get-final-func final-func)
       (process-put proc :el-get-start-process-list (cdr commands))
       (set-process-sentinel proc 'el-get-start-process-list-sentinel)
-      (when filter (set-process-filter proc filter)))))
+      (when filter (set-process-filter proc filter))))
+  ;; no commands, still run the final-func
+  (unless commands
+    (when (functionp final-func)
+      (funcall final-func package))))
 
 
 ;;
@@ -527,20 +539,35 @@ found."
      post-update-fun)))
 
 
+;;
+;; CVS support
+;;
 (defun el-get-cvs-checkout (package url post-install-fun)
   "cvs checkout the package."
   (let* ((cvs-executable (executable-find "cvs"))
 	 (source  (el-get-package-def package))
 	 (module  (plist-get source :module))
+	 (options (plist-get source :options))
 	 (name    (format "*cvs checkout %s*" package))
 	 (ok      (format "Checked out package %s." package))
 	 (ko      (format "Could not checkout package %s." package)))
 
-    (message "%S" `(:args ("-d" ,url "checkout" "-d" ,package ,module)))
+    ;; (message "%S" `(:args ("-d" ,url "checkout" "-d" ,package ,module)))
+    ;; (message "el-get-cvs-checkout: %S" (string= options "login"))
 
     (el-get-start-process-list
      package
-     `((:command-name ,name
+     `(,@(when (string= options "login")
+	   `((:command-name ,(format "*cvs login %s*" package)
+			    :buffer-name ,(format "*cvs login %s*" package)
+			    :default-directory ,el-get-dir
+			    :process-filter ,(function el-get-sudo-password-process-filter)
+			    :program ,cvs-executable
+			    :args ("-d" ,url "login")
+			    :message "cvs login"
+			    :error "Could not login against the cvs server")))
+
+       (:command-name ,name
 		      :buffer-name ,name
 		      :default-directory ,el-get-dir
 		      :program ,cvs-executable
@@ -778,22 +805,27 @@ PACKAGE isn't currently installed by ELPA."
 ;;
 ;; http support
 ;;
-(defun el-get-http-retrieve-callback (url-arg package post-install-fun &optional dest)
+(defun el-get-http-retrieve-callback (url-arg package post-install-fun &optional dest sources)
   "Callback function for `url-retrieve', store the emacs lisp file for the package.
 
 URL-ARG is nil in my tests but `url-retrieve' seems to insist on
 passing it the the callback function nonetheless."
   (let* ((pdir   (el-get-package-directory package))
 	 (dest   (or dest (concat (file-name-as-directory pdir) package ".el")))
-	 (part   (concat dest ".part")))
+	 (part   (concat dest ".part"))
+	 (el-get-sources (if sources sources el-get-sources))
+	 (require-final-newline nil))
     ;; prune HTTP headers before save
     (goto-char (point-min))
     (re-search-forward "^$" nil 'move)
     (forward-char)
     (delete-region (point-min) (point))
     (write-file part)
+    (when (file-exists-p dest)
+      (delete-file dest))
     (rename-file part dest)
-    (message "Renamed to %s" dest))
+    (message "Wrote %s" dest)
+    (kill-buffer))
   (funcall post-install-fun package))
 
 (defun el-get-http-install (package url post-install-fun &optional dest)
@@ -802,7 +834,7 @@ passing it the the callback function nonetheless."
     (unless (file-directory-p pdir)
       (make-directory pdir))
     (url-retrieve
-     url 'el-get-http-retrieve-callback `(,package ,post-install-fun ,dest))))
+     url 'el-get-http-retrieve-callback `(,package ,post-install-fun ,dest ,el-get-sources))))
 
 
 ;;
@@ -846,16 +878,17 @@ the files up."
 	 (ko      (format "Could not install package %s." package))
 	 (post `(lambda (package)
 		  ;; tar xzf `basename url`
-		  (el-get-start-process-list
-		   package
-		   '((:command-name ,name
-				    :buffer-name ,name
-				    :default-directory ,pdir
-				    :program ,(executable-find "tar")
-				    :args (,@options ,tarfile)
-				    :message ,ok
-				    :error ,ko))
-		   ,(symbol-function post-install-fun)))))
+		  (let ((el-get-sources '(,@el-get-sources)))
+		    (el-get-start-process-list
+		     package
+		     '((:command-name ,name
+				      :buffer-name ,name
+				      :default-directory ,pdir
+				      :program ,(executable-find "tar")
+				      :args (,@options ,tarfile)
+				      :message ,ok
+				      :error ,ko))
+		     ,(symbol-function post-install-fun))))))
     (el-get-http-install package url post dest)))
 
 (add-hook 'el-get-http-tar-install-hook 'el-get-http-tar-cleanup-extract-hook)
@@ -871,6 +904,18 @@ the files up."
 	(dired-delete-file pdir 'always)
       (message "el-get could not find package directory \"%s\"" pdir))
     (funcall post-remove-fun package)))
+
+(defun el-get-build-command-program (name)
+  "Given the user command name, get the command program to execute.
+
+That will find the program in current $PATH for you, unless given
+command name is a relative filename beginning with \"./\", or its
+absolute filename obtained with expand-file-name is executable."
+  (let ((fullname (expand-file-name name))
+	(exe      (executable-find name)))
+    (cond ((string-match "^\./" name)   name)
+	  ((file-executable-p fullname) fullname)
+	  (t (or exe name)))))
 
 (defun el-get-build (package commands &optional subdir sync post-build-fun)
   "Run each command from the package directory."
@@ -892,9 +937,7 @@ the files up."
 	     (mapcar (lambda (c)
 		       (let* ((split    (split-string c))
 			      (name     (car split))
-			      (program  (if (file-executable-p (expand-file-name name))
-					    (expand-file-name name)
-					  (executable-find name)))
+			      (program  (el-get-build-command-program name))
 			      (args     (cdr split)))
 
 			 `(:command-name ,name
@@ -1119,10 +1162,10 @@ entry."
       ;; if a feature is provided, require it now
       (when feats
 	(mapc (lambda (feat)
-		(let ((feature (if (stringp feat) (intern-soft feat) feat)))
+		(let ((feature (if (stringp feat) (intern feat) feat)))
 		  (message "require '%s" (require feature))))
 	      (cond ((symbolp feats) (list feats))
-		    ((stringp feats) (list (intern-soft feats)))
+		    ((stringp feats) (list (intern feats)))
 		    (t feats)))))
 
     ;; call the "after" user function
@@ -1189,7 +1232,11 @@ from `el-get-sources'.
   (let* ((source   (el-get-package-def package))
 	 (commands (plist-get source :build)))
     (el-get-build package commands nil nil
-		  (lambda (package) (message "el-get-post-update %s: done" package)))))
+		  (lambda (package) 
+		    (el-get-init package)
+		    ;; fix trailing failed installs
+		    (when (string= (el-get-read-package-status package) "required")
+		      (el-get-save-package-status package "installed"))))))
 
 (defun el-get-update (package)
   "Update PACKAGE."
@@ -1271,8 +1318,11 @@ suitable for use in your emacs init script.
 	  ;; check if the package needs to be fetched (and built)
 	  (if (el-get-package-exists-p package)
 	      (if (and status (string= "installed" status))
-		  (el-get-init package)
-		(error "Package %s failed to install, remove it first." package))
+		  (condition-case err 
+		      (el-get-init package)
+		    ((debug error) ;; catch-all, allow for debugging
+		     (message "%S" (error-message-string err))))
+		(message "Package %s failed to install, remove it first." package))
 	    (el-get-install package))))
       el-get-sources))
 
