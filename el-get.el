@@ -30,6 +30,8 @@
 ;;   - Add lots of recipes
 ;;   - Add support for `system-type' specific build commands
 ;;   - Byte compile files from the load-path entries or :compile files
+;;   - Implement support for git submodules with the command
+;;     `git submodule update --init --recursive`
 ;;
 ;;  0.9 - 2010-08-24 - build me a shell
 ;;
@@ -73,6 +75,7 @@
 (require 'dired)
 (require 'package nil t) ; that's ELPA, but you can use el-get to install it
 (require 'cl)            ; needed for `remove-duplicates'
+(require 'bytecomp)
 
 (defgroup el-get nil "el-get customization group"
   :group 'convenience)
@@ -220,11 +223,12 @@ definition provided by `el-get' recipes locally.
 :compile
 
     Allow to restrict what to byte-compile: by default, `el-get'
-    will compile all elisp files in the :load-path
-    directories. Given a :compile property, `el-get' will only
-    byte-compile those given files in the property value. This
-    property can be a `listp' or a `stringp' if you want to
-    compile only one file.
+    will compile all elisp files in the :load-path directories,
+    unless a :build command exists for the package source. Given
+    a :compile property, `el-get' will only byte-compile those
+    given files, directories or filename-regexpes in the property
+    value. This property can be a `listp' or a `stringp' if you
+    want to compile only one of those.
 
 :info
 
@@ -429,6 +433,7 @@ found."
 (defun el-get-git-clone (package url post-install-fun)
   "Clone the given package following the URL."
   (let* ((git-executable (el-get-git-executable))
+	 (pdir (el-get-package-directory package))
 	 (name (format "*git clone %s*" package))
 	 (ok   (format "Package %s installed." package))
 	 (ko   (format "Could not install package %s." package)))
@@ -441,7 +446,14 @@ found."
 		      :program ,git-executable
 		      :args ( "--no-pager" "clone" ,url ,package)
 		      :message ,ok
-		      :error ,ko))
+		      :error ,ko)
+       (:command-name "*git submodule update*"
+		      :buffer-name ,name
+		      :default-directory ,pdir
+		      :program ,git-executable
+		      :args ("--no-pager" "submodule" "update" "--init" "--recursive")
+		      :message "git submodule update ok"
+		      :error "Could not update git submodules"))
      post-install-fun)))
 
 (defun el-get-git-pull (package url post-update-fun)
@@ -460,7 +472,14 @@ found."
 		      :program ,git-executable
 		      :args ( "--no-pager" "pull")
 		      :message ,ok
-		      :error ,ko))
+		      :error ,ko)
+       (:command-name "*git submodule update*"
+		      :buffer-name ,name
+		      :default-directory ,pdir
+		      :program ,git-executable
+		      :args ("--no-pager" "submodule" "update" "--init" "--recursive")
+		      :message "git submodule update ok"
+		      :error "Could not update git submodules"))
      post-update-fun)))
 
 
@@ -1074,10 +1093,10 @@ entry."
        (format "%S" (if s (plist-put s p status)
 		      `(,p ,status)))))))
 
-(defun el-get-count-package-with-status (status)
+(defun el-get-count-package-with-status (&rest status)
   "Return how many packages are currently in given status"
   (loop for (p s) on (el-get-read-all-packages-status) by 'cddr 
-	if (string= status s) sum 1))
+	if (member s status) sum 1))
 
 (defun el-get-package-status (package &optional package-status-plist)
   "Return current status of package from given list"
@@ -1126,6 +1145,14 @@ entry."
   "Ask user for a package name in minibuffer, with completion."
   (completing-read (format "%s package: " action)
                    (el-get-package-name-list merge-recipes) nil t))
+
+(defun el-get-byte-compile-file (pdir f)
+  "byte-compile the PDIR/F file if there's no .elc or the source is newer"
+  (let* ((el  (concat (file-name-as-directory pdir) f))
+	 (elc (concat (file-name-sans-extension el) ".elc")))
+    (when (or (not (file-exists-p elc))
+	      (file-newer-than-file-p el elc))
+      (byte-compile-file el))))
 
 (defun el-get-init (package)
   "Care about `load-path', `Info-directory-list', and (require 'features)."
@@ -1176,12 +1203,19 @@ entry."
     ;; byte-compile either :compile entries or anything in load-path
     (let ((byte-compile-warnings nil))
       (if compile
-	  (dolist (f (if (listp compile) compile (list compile)))
-	    (byte-compile-file (concat (file-name-as-directory pdir) f)))
-	;; Compile .el files in that directory
-	(dolist (dir el-path)
-	  (byte-recompile-directory 
-	   (expand-file-name (concat (file-name-as-directory pdir) dir) 0)))))
+	  (dolist (path (if (listp compile) compile (list compile)))
+	    (let ((fp (concat (file-name-as-directory pdir) path)))
+	      ;; we accept directories, files and file name regexp
+	      (cond ((file-directory-p fp) (byte-recompile-directory fp 0))
+		    ((file-exists-p fp)    (el-get-byte-compile-file pdir path))
+		    (t ; regexp case
+		     (dolist (file (directory-files pdir nil path))
+		       (el-get-byte-compile-file pdir file))))))
+	;; Compile .el files in that directory --- unless we have build instructions
+	(unless (el-get-build-commands package)
+	  (dolist (dir el-path)
+	    (byte-recompile-directory
+	     (expand-file-name (concat (file-name-as-directory pdir) dir)) 0)))))
 
     ;; loads
     (when loads
@@ -1335,7 +1369,18 @@ the el-get-sources setup.
 el-get is also responsible for doing (require 'feature) for each
 and every feature declared in `el-get-sources', so that it's
 suitable for use in your emacs init script.
-"
+
+By default (SYNC is nil), `el-get' will run all the installs
+concurrently so that you can still use Emacs to do your normal
+work. When SYNC is non-nil (any value will do, 'sync for
+example), then `el-get' will enter a wait-loop and only let you
+use Emacs once it has finished with its job. That's useful an
+option to use in your `user-init-file'.
+
+Please note that the `el-get-init' part of `el-get' is always
+done synchronously, so you will have to wait here. There's
+`byte-compile' support though, and the packages you use are
+welcome to use `autoload' too."
   (let* ((p-status    (el-get-read-all-packages-status))
          (total       (length (el-get-package-name-list)))
          (installed   (el-get-count-package-with-status "installed"))
@@ -1366,12 +1411,12 @@ suitable for use in your emacs init script.
     (when sync
       (while (> (- total installed) 0)
 	(sleep-for 0.2)
-	(setq installed (el-get-count-package-with-status "installed"))
+	;; don't forget to account for installation failure
+	(setq installed (el-get-count-package-with-status "installed" "required"))
 	(progress-reporter-update progress (- total installed)))
       (progress-reporter-done progress))
 
     ;; return the list of packages
     ret))
-      
 
 (provide 'el-get)
